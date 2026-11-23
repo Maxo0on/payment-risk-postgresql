@@ -1,0 +1,56 @@
+name: PostgreSQL checks
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: payments
+          POSTGRES_USER: payments
+          POSTGRES_PASSWORD: payments_dev
+        ports:
+          - '5432:5432'
+        options: >-
+          --health-cmd "pg_isready -U payments -d payments"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PAYMENT_RISK_PG_DSN: postgresql://payments:payments_dev@127.0.0.1:5432/payments
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install project
+        run: python -m pip install -e .
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Run demo
+        run: python -m payment_risk --days 42 --out results_ci
+      - name: Check demo outputs
+        run: |
+          for artifact in report.html hourly_mart.parquet transaction_mart.parquet \
+                          risk_metrics.csv policy_metrics.csv forecast_next_24h.csv \
+                          anomaly_hours.csv test_scored.csv; do
+            test -s "results_ci/$artifact"
+          done
+      - name: Upload demo report
+        uses: actions/upload-artifact@v4
+        with:
+          name: payment-risk-demo
+          path: |
+            results_ci/report.html
+            results_ci/risk_metrics.csv
+            results_ci/policy_metrics.csv
+            results_ci/forecast_metrics.csv
+          if-no-files-found: error

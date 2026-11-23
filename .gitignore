@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.egg-info/
+results*/
+build/
+dist/
+.env
+.env.*
+data/
+*.csv
+*.csv.gz
+*.parquet
