@@ -1,4 +1,10 @@
-"""Build the standalone project report from a completed pipeline run."""
+"""Собирает русскоязычный HTML-отчёт по завершённому запуску конвейера.
+
+Основные таблицы берутся из сводок аудита, прогноза и скоринга, а почасовые
+графики и список аномалий — из CSV-файлов прогона. Модуль форматирует готовые
+метрики и явно показывает периоды и когорты, на которых они рассчитаны.
+Стили и PNG-графики встраиваются в документ для просмотра одним файлом.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +28,8 @@ TEAL = "#037d77"
 AMBER = "#b36416"
 GRID = "#e6edf2"
 
+# Широкие таблицы прокручиваются внутри страницы. Правила печати уменьшают
+# отступы и стараются сохранить строки таблиц и графики на одной странице.
 CSS = """
 :root {
   color-scheme: light;
@@ -76,28 +84,44 @@ footer { padding: 20px 0 30px; background: var(--soft); color: var(--muted); fon
 
 
 def _text(value: object) -> str:
+    """Преобразует значение в строку и экранирует HTML, включая кавычки в атрибутах."""
     return escape(str(value), quote=True)
 
 
 def _number(value: object, digits: int = 0) -> str:
+    """Форматирует число с `digits` знаками после запятой и группировкой разрядов.
+
+    Пробелы между разрядами неразрывные. Для отсутствующего значения выводится тире.
+    """
     if value is None or pd.isna(value):
         return "—"
     return f"{float(value):,.{digits}f}".replace(",", "\u00a0").replace(".", ",")
 
 
 def _share(value: object, digits: int = 1) -> str:
+    """Переводит долю в проценты с `digits` знаками. Для пропуска возвращает тире."""
     if value is None or pd.isna(value):
         return "—"
     return f"{_number(float(value) * 100, digits)}\u00a0%"
 
 
 def _utc(value: object) -> str:
+    """Форматирует метку времени UTC с точностью до минуты для вывода в отчёте.
+
+    При явном смещении время переводится в UTC, а метка без смещения трактуется
+    как UTC. Для пропущенной метки выводится тире.
+    """
     if value is None or pd.isna(value):
         return "—"
     return pd.to_datetime(value, utc=True).strftime("%d.%m.%Y %H:%M")
 
 
 def _table(headers: tuple[str, ...], rows) -> str:
+    """Возвращает HTML-таблицу по заголовкам и итерируемой последовательности строк.
+
+    Ячейки и заголовки экранируются как текст. При отсутствии строк выводится
+    короткое сообщение, а контейнер таблицы позволяет прокручивать широкие столбцы.
+    """
     body = "".join(
         "<tr>" + "".join(f"<td>{_text(cell)}</td>" for cell in row) + "</tr>"
         for row in rows
@@ -112,6 +136,11 @@ def _table(headers: tuple[str, ...], rows) -> str:
 
 
 def _csv(out: Path, name: str) -> pd.DataFrame:
+    """Читает CSV-артефакт `name` из `out` для таблицы или графика.
+
+    Для отсутствующего либо физически пустого файла возвращается пустой DataFrame.
+    Прочие ошибки ввода и разбора передаются вызывающему коду.
+    """
     try:
         return pd.read_csv(out / name)
     except (FileNotFoundError, pd.errors.EmptyDataError):
@@ -119,6 +148,11 @@ def _csv(out: Path, name: str) -> pd.DataFrame:
 
 
 def _figure(figure: Figure, alt: str, caption: str) -> str:
+    """Формирует HTML-блок с PNG, альтернативным текстом и видимой подписью.
+
+    Agg рендерит фигуру Matplotlib в памяти. Данные PNG кодируются в Base64,
+    чтобы браузер мог открыть изображение из HTML без соседних файлов.
+    """
     buffer = BytesIO()
     FigureCanvasAgg(figure).print_png(buffer)
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
@@ -129,6 +163,7 @@ def _figure(figure: Figure, alt: str, caption: str) -> str:
 
 
 def _style_axis(axis) -> None:
+    """Задаёт оси Matplotlib общую сетку и умеренную плотность подписей делений."""
     for spine in axis.spines.values():
         spine.set_visible(False)
     axis.tick_params(colors=MUTED, labelsize=9, length=0, pad=6)
@@ -138,12 +173,21 @@ def _style_axis(axis) -> None:
 
 
 def _card(value: str, label: str) -> str:
+    """Возвращает HTML-карточку с экранированными значением и подписью показателя."""
     return f'<div class="kpi"><strong>{_text(value)}</strong><span>{_text(label)}</span></div>'
 
 
 def _data_section(run_info: dict, audit: dict) -> str:
+    """Собирает раздел об источнике, очистке и временных границах выборок.
+
+    `run_info` задаёт источник данных, интервалы и время наблюдения меток.
+    `audit` содержит счётчики дублей, нормализованных статусов, редких категорий
+    и операций, исключённых из неполных часов. Возвращается фрагмент HTML.
+    """
     source_is_synthetic = bool(run_info.get("synthetic"))
     source = "Синтетический набор" if source_is_synthetic else "Пользовательский CSV"
+    # Граница train_end одновременно завершает обучение и открывает валидацию.
+    # Аналогично validation_end служит первой меткой времени теста.
     periods = _table(
         ("Интервал", "Начало UTC", "Правая граница UTC"),
         (
@@ -183,6 +227,11 @@ def _data_section(run_info: dict, audit: dict) -> str:
 
 
 def _marts_section() -> str:
+    """Возвращает HTML с описанием двух витрин PostgreSQL и состава признаков.
+
+    Раздел объясняет окна строго до момента платежа, доступность исторического
+    статуса и правила риск-сегмента мерчанта.
+    """
     return """
 <section id="sql"><h2>2–3. SQL-витрины и признаки</h2>
 <p>PostgreSQL строит часовую витрину на уровне «час UTC × категория мерчанта». Часы без операций заполнены нулями.
@@ -213,6 +262,8 @@ def _marts_section() -> str:
 """
 
 
+# Машинные имена используются при чтении артефактов. Подписи для отчёта общие
+# для графиков, таблиц и пояснений.
 TARGET_LABELS = {
     "n_transactions": "Число операций",
     "total_amount": "Оборот",
@@ -223,9 +274,17 @@ SPLIT_LABELS = {"train": "Обучение", "validation": "Валидация",
 
 
 def _forecast_figure(test: pd.DataFrame, review: pd.DataFrame) -> str:
+    """Строит четыре почасовых графика с общей шкалой времени UTC.
+
+    `test` содержит `hour` и пары фактических и прогнозных значений трёх рядов.
+    `review` содержит `hour` и значения нагрузки по решениям политики и прогнозу.
+    Возвращает HTML со встроенным PNG или пустую строку при отсутствии данных.
+    """
     if test.empty or review.empty:
         return ""
     figure = Figure(figsize=(10.6, 7.6), dpi=125, layout="constrained")
+    # Общая ось времени даёт возможность сопоставить пики в одни часы.
+    # Для каждого показателя оставлена своя ось Y из-за разных единиц и масштаба.
     axes = figure.subplots(4, 1, sharex=True)
     hour = pd.to_datetime(test["hour"], utc=True)
     for axis, (target, label) in zip(axes, TARGET_LABELS.items()):
@@ -235,6 +294,7 @@ def _forecast_figure(test: pd.DataFrame, review: pd.DataFrame) -> str:
         _style_axis(axis)
     axes[0].legend(loc="upper right", frameon=False, ncols=2, fontsize=9)
 
+    # Нагрузка по скорингу получена из решений ретроспективной симуляции.
     axis = axes[-1]
     review_hour = pd.to_datetime(review["hour"], utc=True)
     axis.plot(review_hour, review["observed_review_count"], color=BLUE, linewidth=1.05,
@@ -257,6 +317,12 @@ def _forecast_figure(test: pd.DataFrame, review: pd.DataFrame) -> str:
 
 
 def _forecast_section(out: Path, forecast: dict) -> str:
+    """Собирает сравнение методов прогноза и разбор нагрузки ручной проверки.
+
+    `forecast` содержит выбранные методы, размеры частей валидации и сводку пиков.
+    CSV-файлы в `out` дают метрики по разрезам и почасовые ряды для графиков.
+    Возвращается фрагмент HTML с показателями, прогнозами и их интерпретацией.
+    """
     metrics = _csv(out, "forecast_metrics.csv")
     review = _csv(out, "review_load.csv")
     selected = forecast.get("selected_models", {})
@@ -267,6 +333,8 @@ def _forecast_section(out: Path, forecast: dict) -> str:
                 continue
             matches = metrics.loc[metrics["target"].eq(target) & metrics["method"].eq(method)]
             splits = matches.set_index("split").to_dict(orient="index")
+            # Выбор метода основан на первой части валидации. Тестовые метрики
+            # характеризуют качество уже выбранного метода на другом периоде.
             validation = splits.get("validation_selection", {})
             test = splits.get("test", {})
             forecast_rows.append((
@@ -294,6 +362,8 @@ def _forecast_section(out: Path, forecast: dict) -> str:
     )
     peak_note = ""
     if not review.empty:
+        # Сравнение в один час показывает ошибку оценки пика. Максимум прогноза
+        # может относиться к другой дате, поэтому он вынесен в таблицу отдельно.
         observed_peak = review.loc[review["observed_review_count"].idxmax()]
         peak_note = (
             f'<p>В час максимальной нагрузки скоринг отправил на проверку '
@@ -347,6 +417,12 @@ def _forecast_section(out: Path, forecast: dict) -> str:
 
 
 def _anomaly_section(out: Path, run_info: dict, forecast: dict) -> str:
+    """Показывает сильнейшие алерты теста и проверяет их на сценариях генератора.
+
+    Данные для таблицы читаются из `anomaly_hours.csv`. Если `run_info` содержит
+    сценарии генератора, их часы сопоставляются с алертами после перевода в UTC.
+    Сводка `forecast` задаёт общее число подозрительных часов. Результат — HTML.
+    """
     anomalies = _csv(out, "anomaly_hours.csv")
     synthetic = run_info.get("synthetic") or {}
     scenarios = synthetic.get("injected_anomalies", [])
@@ -358,6 +434,8 @@ def _anomaly_section(out: Path, run_info: dict, forecast: dict) -> str:
         hour = pd.to_datetime(scenario["hour"], utc=True)
         if start_test <= hour < end_test:
             test_scenarios.append((hour, scenario))
+    # Сопоставление ведётся по уникальным часам. Несколько сценариев или
+    # аномальных показателей в одном часе дают один час в сводном счётчике.
     synthetic_count = sum(hour in alert_hours for hour in {hour for hour, _ in test_scenarios})
     test_hours = len({hour for hour, _ in test_scenarios})
     scenario_hours = {hour for hour, _ in test_scenarios}
@@ -423,11 +501,19 @@ def _anomaly_section(out: Path, run_info: dict, forecast: dict) -> str:
 
 
 def _risk_section(out: Path, risk: dict) -> str:
+    """Собирает HTML о зрелости меток, качестве моделей и выборе политики.
+
+    `risk` предоставляет численности и метрики по периодам, выбранную модель
+    и оценки её конкурентов на валидации. Из `feature_importance.csv` в `out`
+    берётся первая пятёрка отсортированных по важности признаков.
+    """
     label_rows = []
     for split, label in SPLIT_LABELS.items():
         counts = risk.get("label_counts", {}).get(split, {})
         mature = counts.get("mature", 0)
         fraud = counts.get("fraud", 0)
+        # Доля fraud относится к известным исходам. Для когорты без созревших
+        # меток доля неизвестна и отображается тире.
         label_rows.append((
             label, _number(counts.get("transactions")), _number(mature), _number(fraud),
             _share(fraud / mature if mature else None, 2),
@@ -483,6 +569,12 @@ Recall@K показывает, какая доля всего fraud попала
 
 
 def _policy_figure(approve_all: dict, optimized: dict) -> str:
+    """Рисует разложение тестовых потерь на три денежных компонента.
+
+    Сводки двух политик рассчитаны на одной когорте с созревшими метками.
+    Сегменты столбца показывают ущерб от fraud, проверки и ложные отказы.
+    Возвращается HTML со встроенным PNG либо пустая строка без обеих сводок.
+    """
     if not approve_all or not optimized:
         return ""
     figure = Figure(figsize=(10.6, 2.55), dpi=125, layout="constrained")
@@ -498,6 +590,8 @@ def _policy_figure(approve_all: dict, optimized: dict) -> str:
         ("review_cost", "Проверки", TEAL),
         ("false_decline_cost", "Ложные отклонения", AMBER),
     )
+    # Каждый компонент начинается там, где закончился предыдущий, поэтому
+    # полная длина столбца соответствует общей стоимости политики.
     offsets = [0.0, 0.0]
     for key, label, color in components:
         widths = [optimized[key], approve_all[key]]
@@ -512,6 +606,12 @@ def _policy_figure(approve_all: dict, optimized: dict) -> str:
 
 
 def _policy_section(risk: dict) -> str:
+    """Объясняет пороги, бизнес-ограничения и стоимость политики в HTML.
+
+    `risk` содержит параметры симуляции, пороги и результаты обеих политик
+    на валидации и тесте. Таблицы показывают объём решений на всех операциях
+    и ожидаемые потери по когорте с созревшими метками.
+    """
     costs = risk.get("costs", {})
     thresholds = risk.get("thresholds", {})
     outcomes = risk.get("policy_metrics", [])
@@ -529,6 +629,8 @@ def _policy_section(risk: dict) -> str:
             for row in outcomes
         ),
     )
+    # Лимиты оцениваются для оптимизированной политики. Базовая политика
+    # даёт точку сравнения для объёмов решений и финансовых результатов.
     limit_check = _table(
         ("Период", "Лимит ручной проверки", "Лимит fraud loss"),
         (
@@ -573,18 +675,33 @@ def _policy_section(risk: dict) -> str:
 
 
 def _test_policies(risk: dict) -> tuple[dict, dict]:
+    """Возвращает тестовые сводки `approve_all` и `optimized` в таком порядке.
+
+    Для отсутствующей политики возвращается пустой словарь.
+    """
     outcomes = risk.get("policy_metrics", [])
     test = {row["policy"]: row for row in outcomes if row["split"] == "test"}
     return test.get("approve_all", {}), test.get("optimized", {})
 
 
 def _reduction(before: object, after: object) -> float | None:
+    """Выражает изменение как долю снижения относительно исходного значения.
+
+    Возвращает `(before − after) / before`. Для нулевой или отсутствующей базы
+    и для отсутствующего результата возвращает `None`.
+    """
     if before and after is not None:
         return (float(before) - float(after)) / float(before)
     return None
 
 
 def _overview_section(run_info: dict, risk: dict) -> str:
+    """Формирует вводные карточки по тесту и отмечает происхождение данных.
+
+    Снижение ущерба и общих потерь рассчитано относительно одобрения всех
+    операций. Остальные карточки показывают объём ручных проверок и ожидаемое
+    число ложных отказов. Возвращается фрагмент HTML.
+    """
     baseline, optimized = _test_policies(risk)
     improvement_fraud = _reduction(baseline.get("fraud_loss"), optimized.get("fraud_loss"))
     improvement_total = _reduction(baseline.get("total_cost"), optimized.get("total_cost"))
@@ -610,11 +727,19 @@ def _overview_section(run_info: dict, risk: dict) -> str:
 
 
 def _business_section(run_info: dict, risk: dict) -> str:
+    """Формирует итог об эффективности, ёмкости и ограничениях симуляции.
+
+    `risk` даёт фактическую долю проверок в симуляции, лимиты и ожидаемые
+    финансовые результаты. `run_info` определяет применимые оговорки для
+    генератора или пользовательских данных. Возвращается фрагмент HTML.
+    """
     _, optimized = _test_policies(risk)
     costs = risk.get("costs", {})
     capacity = costs.get("review_capacity")
     review_met = optimized.get("review_limit_met")
     if review_met is False:
+        # Лимит — доля от всех операций. Округление вниз даёт максимальное
+        # допустимое целое число проверок, а добавка сглаживает погрешность float.
         max_reviews = floor(capacity * optimized["transactions"] + 1e-9)
         extra_reviews = optimized["review_count"] - max_reviews
         capacity_note = (
@@ -680,9 +805,17 @@ false decline и полный ущерб после обновления пол�
 
 
 def write_report(out: Path, *, run_info: dict, audit: dict, risk: dict, forecast: dict) -> Path:
-    """Write an offline HTML report with Russian narrative and embedded figures."""
+    """Записывает автономный `report.html` в `out` и возвращает путь к файлу.
+
+    `out` — существующий каталог результатов с CSV-файлами прогона.
+    `run_info` задаёт источник и временные границы, `audit` описывает очистку,
+    `risk` содержит метрики моделей и политик, `forecast` — итог прогноза
+    и детекции. Разделы записываются в UTF-8. CSS и графики входят в HTML.
+    """
     out = Path(out)
     path = out / "report.html"
+    # Краткий тестовый результат открывает документ. Дальше идут этапы
+    # конвейера, а бизнес-интерпретация опирается на уже показанные таблицы.
     sections = (
         _overview_section(run_info, risk),
         _data_section(run_info, audit),

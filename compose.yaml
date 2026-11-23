@@ -1,19 +1,28 @@
+# Docker Compose запускает только базу. Python запускается из терминала.
 services:
   postgres:
+    # Фиксируем основную версию PostgreSQL, внутри неё доступны исправления.
     image: postgres:16
+    # Учётные данные для локального демо совпадают со строкой подключения в README.
     environment:
       POSTGRES_DB: payments
       POSTGRES_USER: payments
       POSTGRES_PASSWORD: payments_dev
     ports:
+      # Формат адрес:порт_хоста:порт_контейнера. Снаружи компьютера сервис недоступен.
+      # PAYMENT_RISK_POSTGRES_PORT позволяет выбрать другой порт на хосте.
       - "127.0.0.1:${PAYMENT_RISK_POSTGRES_PORT:-5432}:5432"
     volumes:
+      # Именованный том сохраняет данные PostgreSQL между запусками контейнера.
       - payments-data:/var/lib/postgresql/data
     healthcheck:
+      # Команда docker compose up --wait ждёт готовности базы. Двойной знак $
+      # передаёт переменные оболочке внутри контейнера для подстановки.
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 2s
       timeout: 3s
       retries: 20
 
+# Объявление тома, использованного сервисом postgres.
 volumes:
   payments-data:

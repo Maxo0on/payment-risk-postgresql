@@ -1,3 +1,4 @@
+# pip использует setuptools для сборки пакета и установки из исходников.
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -6,25 +7,31 @@ build-backend = "setuptools.build_meta"
 name = "payment-risk-lab"
 version = "1.1.0"
 description = "Payment risk and hourly forecasting with PostgreSQL feature marts"
+# Диапазон версий Python, который pip проверяет при установке проекта.
 requires-python = ">=3.11,<3.15"
+# pip устанавливает эти библиотеки вместе с проектом. Нижняя граница задаёт
+# минимальную версию, а верхняя ограничивает переход на другую серию выпусков.
 dependencies = [
-    "catboost>=1.2.8,<2",
-    "lightgbm>=4.6,<5",
-    "matplotlib>=3.9,<4",
-    "numpy>=1.26,<3",
-    "pandas>=2.2,<3",
-    "psycopg[binary]>=3.2,<4",
-    "pyarrow>=17,<27",
-    "scikit-learn>=1.5,<2",
-    "statsmodels>=0.14.4,<0.16",
-    "threadpoolctl>=3.5,<4",
+    "catboost>=1.2.8,<2",        # Одна из двух моделей риска.
+    "lightgbm>=4.6,<5",         # Вторая модель риска.
+    "matplotlib>=3.9,<4",       # Графики для HTML-отчёта.
+    "numpy>=1.26,<3",           # Массивы и численные вычисления.
+    "pandas>=2.2,<3",           # Таблицы и обработка временных меток.
+    "psycopg[binary]>=3.2,<4",   # Подключение к PostgreSQL с готовыми бинарными компонентами.
+    "pyarrow>=17,<27",          # Чтение и запись Parquet.
+    "scikit-learn>=1.5,<2",      # Метрики моделей и бустинг для почасового прогноза.
+    "statsmodels>=0.14.4,<0.16", # Статистическая модель SARIMAX.
+    "threadpoolctl>=3.5,<4",     # Ограничение числа потоков при вычислениях.
 ]
 
+# После установки команда payment-risk вызывает функцию main из CLI-модуля.
 [project.scripts]
 payment-risk = "payment_risk.cli:main"
 
+# Поиск Python-пакетов начинается в каталоге src.
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# SQL-запросы входят в установленный пакет, чтобы витрины работали и после сборки.
 [tool.setuptools.package-data]
 payment_risk = ["sql/*.sql"]

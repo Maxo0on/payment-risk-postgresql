@@ -1,4 +1,13 @@
-"""Fixed-origin hourly forecasts, residual alerts, and review workload."""
+"""Почасовой прогноз нагрузки, поиск аномалий и оценка ручной проверки.
+
+Часовая витрина по категориям поставляет фактические ряды числа операций,
+оборота и операционных риск-сигналов. SARIMAX и бустинг обучаются на одном
+отрезке истории и выпускают прогнозы блоками до 24 часов. На валидации
+выбирается модель для каждой цели и фиксируются пороги тревоги. На тесте
+оцениваются прогнозы, а аномалии получают пояснения из истории категорий.
+Число ручных проверок по решениям риск-политики на тестовых операциях
+сопоставляется с прогнозом нагрузки.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +26,7 @@ from threadpoolctl import threadpool_limits
 TARGETS = ("n_transactions", "total_amount", "risk_events")
 METHODS = ("sarimax", "lag_boosting")
 HORIZON = 24
+# Лаг 168 часов соответствует тому же часу предыдущей недели.
 LAGS = (1, 2, 3, 6, 12, 24, 48, 72, 168)
 ROLLING_MEANS = (3, 6, 24, 168)
 ROLLING_STDS = (6, 24, 168)
@@ -40,10 +50,22 @@ ALERT_COLUMNS = (
 
 
 def _utc_timestamp(value: pd.Timestamp) -> pd.Timestamp:
+    """Приводит границу выборки к UTC для сравнения с часовым индексом.
+
+    Метка с часовым поясом переводится в UTC с сохранением момента времени.
+    Метка без пояса интерпретируется как UTC.
+    """
     return pd.to_datetime(value, utc=True)
 
 
 def _calendar(index: pd.DatetimeIndex) -> tuple[np.ndarray, np.ndarray]:
+    """Возвращает матрицы календарных признаков для двух моделей.
+
+    Строка соответствует часу из `index`. SARIMAX получает флаг выходного
+    и пары синуса и косинуса для четырёх суточных и трёх недельных гармоник.
+    Бустинг дополнительно получает числовые час суток и день недели.
+    Календарь вычислим для любого будущего часа в момент выпуска прогноза.
+    """
     elapsed = np.asarray(
         (index - pd.Timestamp("2000-01-03", tz="UTC")) / pd.Timedelta(hours=1)
     )
@@ -59,6 +81,12 @@ def _calendar(index: pd.DatetimeIndex) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _blocks(n_train: int, n_validation_end: int, n_observed: int) -> list[tuple[int, int]]:
+    """Задаёт полуоткрытые интервалы позиций `[start, end)` для выпусков прогноза.
+
+    Блоки валидации и теста нарезаются отдельно, поэтому граничный блок
+    каждого периода может быть короче 24 часов. Последний блок соответствует
+    24 будущим часам, начиная с первой позиции после наблюдаемого ряда.
+    """
     blocks = []
     for phase_start, phase_end in ((n_train, n_validation_end), (n_validation_end, n_observed)):
         for start in range(phase_start, phase_end, HORIZON):
@@ -73,7 +101,18 @@ def _classic(
     n_train: int,
     blocks: list[tuple[int, int]],
 ) -> tuple[np.ndarray, str]:
-    """Fit one SARIMAX per target and update filtered state after each forecast."""
+    """Строит прогноз SARIMAX для одного наблюдаемого ряда.
+
+    Модель AR(1) с константой и календарными регрессорами оценивает параметры
+    на первых `n_train` точках. Масштабирование на среднее обучения улучшает
+    численную устойчивость для рядов разных порядков величины. Факты блока
+    обновляют отфильтрованное состояние после выпуска всего блока с уже
+    оценёнными параметрами.
+
+    Возвращает массив длины календаря с прогнозом в исходных единицах и
+    строковый статус сходимости. Для обучающего периода в массиве стоит
+    `NaN`, для постоянного обучающего ряда выдаётся его константа.
+    """
     training = observed[:n_train]
     predictions = np.full(len(calendar), np.nan)
     if np.ptp(training) == 0:
@@ -99,12 +138,20 @@ def _classic(
         exog = calendar[start:end]
         values = scale * np.asarray(result.forecast(steps=end - start, exog=exog))
         predictions[start:end] = np.maximum(0, values)
+        # Обновляем состояние по фактам только после прогноза всего блока.
         if end <= len(observed):
             result = result.extend(observed[start:end] / scale, exog=exog)
     return predictions, fit_status
 
 
 def _lag_features(history: list[float], calendar: np.ndarray) -> list[float]:
+    """Собирает одну строку признаков для очередного прогнозируемого часа.
+
+    Последнее значение `history` относится к предыдущему часу. Порядок
+    признаков фиксирован: календарь, заданные лаги, средние по окнам и
+    стандартные отклонения по окнам. В обучении история состоит из фактов,
+    при прогнозировании в неё по мере продвижения добавляются оценки модели.
+    """
     recent = np.asarray(history[-max(LAGS):], dtype=float)
     lags = [float(recent[-lag]) for lag in LAGS]
     means = [float(recent[-width:].mean()) for width in ROLLING_MEANS]
@@ -118,6 +165,16 @@ def _boosting(
     n_train: int,
     blocks: list[tuple[int, int]],
 ) -> np.ndarray:
+    """Обучает гистограммный градиентный бустинг и прогнозирует ряды рекурсивно.
+
+    При обучении каждая строка признаков использует факты строго ранее
+    целевой позиции, поэтому первые 168 наблюдений служат историей для лагов.
+    На старте блока доступна фактическая история до `start`. Каждая оценка
+    становится частью входной истории для следующего часа этого блока.
+
+    Возвращает массив длины календаря в единицах исходной цели. Позиции
+    обучения остаются `NaN`, отрицательные прогнозы ограничиваются нулём.
+    """
     training = observed[:n_train].tolist()
     first = max(LAGS)
     features = np.asarray(
@@ -147,6 +204,12 @@ def _boosting(
 
 
 def _metrics(observed: np.ndarray, forecast: np.ndarray) -> dict[str, float]:
+    """Считает MAE, RMSE и WAPE на совпадающих по часам массивах.
+
+    MAE и RMSE выражены в единицах цели. WAPE равен сумме абсолютных
+    ошибок, делённой на сумму абсолютных фактов, и хранится как доля.
+    При нулевой сумме фактов WAPE имеет значение `NaN`.
+    """
     error = observed - forecast
     total = float(np.abs(observed).sum())
     return {
@@ -157,6 +220,14 @@ def _metrics(observed: np.ndarray, forecast: np.ndarray) -> dict[str, float]:
 
 
 def _alert_calibration(residuals: np.ndarray) -> tuple[float, float, float]:
+    """Возвращает центр, масштаб и односторонний порог для z-оценки остатков.
+
+    Остаток — факт минус прогноз на калибровочной части валидации.
+    Медиана и масштаб 1,4826 × MAD устойчивы к отдельным всплескам. При
+    нулевом MAD используется стандартное отклонение с нижней границей 1.
+    Порог берётся как максимум 3,5 и эмпирического квантиля уровня
+    1 − 0,05 / число прогнозируемых целей.
+    """
     center = float(np.median(residuals))
     scale = float(1.4826 * np.median(np.abs(residuals - center)))
     if scale == 0:
@@ -171,6 +242,14 @@ def _category_history(
     hourly: pd.DataFrame,
     index: pd.DatetimeIndex,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+    """Возвращает факты и сезонные ориентиры в разрезе часа и категории.
+
+    В каждом из двух словарей ключ обозначает показатель, строки таблицы
+    — часы полного индекса, столбцы — категории мерчантов. Ориентир для
+    ячейки — среднее того же часа и дня недели за предыдущие четыре недели.
+    До накопления четырёх недель усредняются доступные недели, а при
+    отсутствии предыдущей недели ячейка ориентира остаётся `NaN`.
+    """
     observed = {}
     seasonal = {}
     for metric in (*TARGETS, "n_declined"):
@@ -182,6 +261,7 @@ def _category_history(
             observed=True,
         ).reindex(index).sort_index(axis=1).fillna(0.0)
         observed[metric] = matrix
+        # Сдвиг ровно на неделю даёт сезонный ориентир только из прошлых часов.
         previous = [matrix.shift(168 * week) for week in range(1, 5)]
         history_count = sum(frame.notna().astype(int) for frame in previous)
         history_sum = sum(frame.fillna(0.0) for frame in previous)
@@ -197,6 +277,12 @@ def _explanation(
     observed: dict[str, pd.DataFrame],
     seasonal: dict[str, pd.DataFrame],
 ) -> str:
+    """Формулирует гипотезу о пике по главной метрике и выбранной категории.
+
+    Для оборота сравнивает средний чек категории с её сезонным ориентиром.
+    Превышение в 1,4 раза выделяет гипотезу о повышенном среднем чеке.
+    В остальных случаях формулировка описывает вид наблюдаемого роста.
+    """
     if excess <= 0:
         return (
             "Значения по категориям укладываются в сезонную базу. "
@@ -225,6 +311,19 @@ def _anomalies(
     calibration: pd.DataFrame,
     index: pd.DatetimeIndex,
 ) -> tuple[pd.DataFrame, dict[str, dict[str, float]]]:
+    """Находит превышения почасовых прогнозов на тесте и объясняет их.
+
+    Для каждой выбранной модели параметры нормирования и порог берутся
+    из калибровочной части валидации. Тестовый час попадает в таблицу, если
+    хотя бы одна z-оценка выше своего верхнего порога. Главная метрика
+    — с максимальной z-оценкой среди сработавших. Категория выбирается
+    по наибольшему превышению недельного ориентира этой метрики. При
+    отсутствии ориентира выбирается категория с максимальным фактом.
+
+    Возвращает строки тревог от самой высокой z-оценки и словарь
+    калибровочных параметров для каждой цели. Порог сохраняется и в
+    единицах z-оценки, и в исходных единицах остатка.
+    """
     z_scores = {}
     thresholds = {}
     for target in selected:
@@ -285,6 +384,13 @@ def _review_load(
     scored: pd.DataFrame,
     reference_review_rate: float,
 ) -> pd.DataFrame:
+    """Сопоставляет ожидаемое и наблюдаемое в ретроспективе число проверок.
+
+    Ожидаемое число — прогноз операций, умноженный на фиксированную долю
+    ручных проверок на валидации. Для наблюдаемого значения суммируются
+    действия `review` риск-политики по часу UTC. Индекс результата совпадает
+    с индексом прогнозов. Часам без таких действий присваивается ноль.
+    """
     reviews = scored.loc[scored["action"].eq("review"), "event_ts"]
     review_counts = pd.to_datetime(reviews, utc=True).dt.floor("h").value_counts()
     output = hourly_forecasts[[
@@ -306,10 +412,23 @@ def run_forecast(
     reference_review_rate: float = 0.05,
     risk_events_definition: str = "observable operational risk events",
 ) -> dict:
-    """Compare both forecasting methods for three targets and explain upper-tail anomalies.
+    """Запускает обучение, сравнение прогнозов, поиск аномалий и расчёт нагрузки.
 
-    Boundaries are inclusive at the start of the next split. Every prediction in
-    a 24-hour block sees only observations in earlier blocks.
+    `hourly` содержит строки часовой витрины по категориям. Для общего
+    прогноза значения суммируются по часам UTC. Разрез категорий сохраняется
+    для объяснения аномалий. `scored` содержит время операции и действие
+    риск-политики для проверки прогноза нагрузки на тесте.
+
+    `train_end` и `validation_end` задают первые часы валидации и теста.
+    Каждый прогнозный блок использует факты только до своего первого часа.
+    Первая часть валидации выбирает метод по MAE отдельно для каждой цели.
+    Остаток валидации определяет пороги тревоги. Тест показывает ошибки
+    обоих методов и работу выбранных моделей с зафиксированными порогами.
+
+    Записывает в `out` CSV с метриками, рядами прогноза, тревогами и
+    нагрузкой. Возвращает сводку выбора моделей, порогов, пиков и
+    ошибки оценки ручных проверок и сохраняет её в JSON. Параметр
+    `risk_events_definition` описывает происхождение риск-сигналов в сводке.
     """
     if not 0 <= reference_review_rate <= 1:
         raise ValueError("reference_review_rate must be between 0 and 1.")
@@ -326,6 +445,7 @@ def run_forecast(
     if not np.isfinite(values).all() or (values < 0).any():
         raise ValueError("Hourly count and amount targets must be finite and nonnegative.")
 
+    # Сплошная сетка сохраняет смысл лагов в часах даже при отсутствии операций.
     index = pd.date_range(data["hour"].min(), data["hour"].max(), freq="h", name="hour")
     totals = data.groupby("hour")[list(TARGETS)].sum().reindex(index, fill_value=0.0)
     n_observed = len(totals)
@@ -337,6 +457,8 @@ def run_forecast(
             "Hourly forecasting requires at least 336 training hours, "
             "48 validation hours, and at least one observed test hour."
         )
+    # Выбор метода заканчивается на границе полного прогнозного блока.
+    # Оставшиеся часы валидации идут на оценку остатков для порогов тревоги.
     n_selection_end = n_train + HORIZON * max(1, (n_validation // 2) // HORIZON)
     full_index = pd.date_range(index[0], freq="h", periods=n_observed + HORIZON, name="hour")
     blocks = _blocks(n_train, n_validation_end, n_observed)
@@ -345,6 +467,7 @@ def run_forecast(
     forecasts["forecast_origin"] = pd.Series(pd.NaT, index=full_index, dtype="datetime64[ns, UTC]")
     forecasts["lead_hours"] = 0
     for start, end in blocks:
+        # Первый час блока имеет горизонт 1: последний факт ему предшествует.
         forecasts.loc[full_index[start:end], "forecast_origin"] = full_index[start]
         forecasts.loc[full_index[start:end], "lead_hours"] = np.arange(1, end - start + 1)
 
@@ -383,6 +506,7 @@ def run_forecast(
             )
             forecasts[f"pred_{target}"] = predictions[selected[target]]
 
+    # Для оценки сохраняем прогнозы обоих методов и отдельно прогноз победителя.
     validation = forecasts.iloc[n_train:n_validation_end]
     calibration = forecasts.iloc[n_selection_end:n_validation_end]
     test = forecasts.iloc[n_validation_end:n_observed]

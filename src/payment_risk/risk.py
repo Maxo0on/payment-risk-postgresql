@@ -1,4 +1,4 @@
-"""Time-split risk models and a cost-based, two-threshold decision policy."""
+"""Обучение моделей риска и экономическая оценка политики с двумя порогами."""
 
 from __future__ import annotations
 
@@ -16,6 +16,20 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 @dataclass(frozen=True)
 class PolicyCosts:
+    """Бизнес-ограничения и параметры сценария ручной проверки.
+
+    `review_capacity` задаёт предельную долю ручных проверок во всём потоке.
+    `max_fraud_loss_ratio` ограничивает остаточные потери относительно
+    сценария, в котором одобряются все операции. `review_cost` и
+    `false_decline_cost` задают стоимость одной проверки и одного ложного
+    отклонения в единицах суммы транзакции.
+
+    `review_fraud_catch_rate` задаёт ожидаемую долю предотвращённого ущерба
+    по мошенническим операциям на проверке. `review_false_decline_rate` задаёт
+    долю легитимных операций на проверке, которые будут ошибочно отклонены. `fraud_lgd` задаёт долю суммы, которая
+    теряется при одобрении мошеннической операции.
+    """
+
     review_capacity: float = 0.06
     max_fraud_loss_ratio: float = 0.35
     review_cost: float = 2.0
@@ -25,6 +39,11 @@ class PolicyCosts:
     fraud_lgd: float = 1.0
 
     def __post_init__(self) -> None:
+        """Проверяет диапазон долей и допустимость денежных ставок.
+
+        Доли лежат в диапазоне [0, 1]. Денежные ставки должны быть конечными
+        и неотрицательными. Некорректный параметр вызывает `ValueError`.
+        """
         for key in (
             "review_capacity",
             "max_fraud_loss_ratio",
@@ -41,6 +60,12 @@ class PolicyCosts:
 
 
 def _mature_rows(frame: pd.DataFrame, cutoff: pd.Timestamp) -> pd.Series:
+    """Возвращает маску доступных меток мошенничества на момент `cutoff`.
+
+    Строка участвует в оценке по исходу, когда `is_fraud` заполнен, а
+    `label_available_at` наступил не позже среза. Индекс исходной таблицы
+    сохраняется для согласованного отбора строк и оценок модели.
+    """
     return frame["is_fraud"].notna() & frame["label_available_at"].le(cutoff)
 
 
@@ -51,6 +76,15 @@ def _model_view(
     *,
     native_categories: bool,
 ) -> pd.DataFrame:
+    """Готовит копию признаков в порядке, который используется при обучении.
+
+    `features` задаёт порядок столбцов. В `categories` перечислены
+    категориальные столбцы и значения, встречавшиеся на обучении.
+    При `native_categories=True` LightGBM получает тип `Categorical`
+    с фиксированным словарём. Незнакомая категория кодируется как пропуск.
+    CatBoost получает строки, включая маркер `__MISSING__` для пропусков.
+    Числовые признаки передаются в формате `float` с сохранением NaN.
+    """
     result = frame[features].copy()
     for column in features:
         if column in categories:
@@ -67,9 +101,20 @@ def _model_view(
 def _scores_at_top(
     observed: pd.DataFrame, scores: np.ndarray, top_share: float
 ) -> dict[str, float | int | None]:
+    """Оценивает ранжирование на строках с доступной бинарной меткой.
+
+    `scores` выровнен по порядку строк `observed`. ROC-AUC сравнивает
+    позиции классов, а `pr_auc_ap` хранит average precision (AP). Размер
+    верхнего сегмента K округляется вверх от доли `top_share` с минимумом
+    в одну строку для непустой выборки. Recall@K показывает долю всех
+    мошеннических операций, попавших в сегмент, а precision@K показывает
+    долю мошеннических операций внутри сегмента. Для неопределённых метрик
+    возвращается `None`.
+    """
     labels = observed["is_fraud"].to_numpy(dtype=int)
     positive_count = int(labels.sum())
     top_k = min(len(labels), max(1, int(np.ceil(top_share * len(labels)))))
+    # При равных оценках стабильная сортировка сохраняет входной порядок.
     top_positive = int(labels[np.argsort(-scores, kind="stable")[:top_k]].sum())
     return {
         "n": len(labels),
@@ -92,6 +137,12 @@ def _scores_at_top(
 def _actions(
     scores: np.ndarray, review_threshold: float, reject_threshold: float
 ) -> np.ndarray:
+    """Возвращает действия в том же порядке, что и оценки модели.
+
+    При `score <= review_threshold` применяется `approve`, при
+    `review_threshold < score <= reject_threshold` применяется `review`,
+    при `score > reject_threshold` применяется `reject`.
+    """
     return np.select(
         [scores > reject_threshold, scores > review_threshold],
         ["reject", "review"],
@@ -102,6 +153,12 @@ def _actions(
 def _fraud_and_legitimate(
     observed: pd.DataFrame, costs: PolicyCosts
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Возвращает потенциальный ущерб и маску легитимных операций.
+
+    Для каждой строки с доступной меткой ущерб при одобрении равен
+    `amount * fraud_lgd` для мошеннических операций и нулю для остальных.
+    Оба массива выровнены по строкам `observed`.
+    """
     target = observed["is_fraud"].to_numpy(dtype=int)
     fraud_amounts = observed["amount"].to_numpy(dtype=float) * target * costs.fraud_lgd
     return fraud_amounts, target == 0
@@ -110,10 +167,17 @@ def _fraud_and_legitimate(
 def _range_minimum(
     values: np.ndarray, left: np.ndarray, right: np.ndarray
 ) -> np.ndarray:
-    """Find the minimum value index in each inclusive interval, preferring later ties."""
+    """Находит индекс минимума на каждом включительном интервале.
+
+    `left` и `right` содержат парные границы непустых интервалов в
+    `values`. Разреженная таблица хранит индексы минимумов на отрезках
+    длиной в степень двойки. При равном значении возвращается больший
+    индекс. Порядок ответов соответствует порядку запросов.
+    """
     spans = right - left + 1
     powers = np.floor(np.log2(spans)).astype(int)
     table = [np.arange(len(values))]
+    # Отрезок длиной 2**level состоит из двух соседних половин из предыдущего уровня.
     for level in range(1, int(powers.max()) + 1):
         half = 1 << (level - 1)
         previous = table[-1]
@@ -122,6 +186,7 @@ def _range_minimum(
     best = np.empty_like(left)
     for level, indices in enumerate(table):
         use = powers == level
+        # Два отрезка такой длины от левой и правой границ покрывают весь запрос.
         first = indices[left[use]]
         second = indices[right[use] - (1 << level) + 1]
         best[use] = np.where(values[first] < values[second], first, second)
@@ -131,9 +196,19 @@ def _range_minimum(
 def _optimize_thresholds(
     cohort: pd.DataFrame, mature: pd.Series, scores: np.ndarray, costs: PolicyCosts
 ) -> tuple[float, float]:
-    """Optimize over every distinct score while routing equal scores together."""
+    """Возвращает пару порогов с минимальной стоимостью на валидации.
+
+    Учитываются все варианты маршрутизации, достижимые двумя порогами.
+    Операции с одинаковым `score` получают одно действие. Лимит ручной
+    проверки считается на всём потоке `cohort`. Ограничение ущерба и
+    денежная функция используют строки из маски `mature`. При равной
+    стоимости выбирается больший `reject_threshold`, а внутри одной
+    границы отклонения — больший `review_threshold`.
+    """
     order = np.argsort(scores, kind="stable")
     ordered_scores = scores[order]
+    # Границы соответствуют концам групп равных оценок. Порог под
+    # минимальной оценкой позволяет задать пустой префикс.
     ends = np.r_[np.flatnonzero(np.diff(ordered_scores)) + 1, len(scores)]
     count = np.r_[0, ends]
     thresholds = np.r_[np.nextafter(ordered_scores[0], -np.inf), ordered_scores[ends - 1]]
@@ -143,12 +218,16 @@ def _optimize_thresholds(
     legitimate = np.zeros(len(cohort), dtype=bool)
     fraud_values[known] = fraud_amount
     legitimate[known] = is_legitimate
+    # Префиксы дают суммы и количества по произвольному диапазону
+    # операций как разность значений в его границах.
     fraud = np.r_[0.0, np.cumsum(fraud_values[order])[ends - 1]]
     legit = np.r_[0, np.cumsum(legitimate[order])[ends - 1]]
     mature_count = np.r_[0, np.cumsum(known[order])[ends - 1]]
 
-    # For each reject boundary j, review count limits the lower bound on i.
-    # Fraud loss is catch * fraud[i] + (1 - catch) * fraud[j].
+    # Для заданной верхней границы j число проверок count[j] − count[i]
+    # задаёт нижнюю границу i. Остаточный ущерб равен сумме ущерба при
+    # одобрении fraud[i] и неперехваченной доли (1 − catch) в интервале
+    # fraud[j] − fraud[i]. Он задаёт верхнюю границу i.
     max_review_count = int(np.floor(costs.review_capacity * len(scores) + 1e-9))
     loss_limit = costs.max_fraud_loss_ratio * fraud[-1]
     catch = costs.review_fraud_catch_rate
@@ -164,8 +243,9 @@ def _optimize_thresholds(
     if not feasible.any():
         raise RuntimeError("No threshold policy satisfies the validation constraints")
 
-    # The objective is the sum of a term for i and a term for j.
-    # Range-minimum queries find the best i for each feasible j.
+    # Стоимость разбивается на независимые слагаемые от i и j. Запрос
+    # минимума на допустимом интервале даёт лучшую нижнюю границу для
+    # каждой верхней. Это позволяет обойтись без перебора всех пар.
     review_term = costs.review_cost * mature_count
     false_decline_review_term = (
         costs.false_decline_cost * costs.review_false_decline_rate * legit
@@ -180,7 +260,7 @@ def _optimize_thresholds(
     feasible_j = np.flatnonzero(feasible)
     best_i = _range_minimum(cost_i, left[feasible], right[feasible])
     losses = cost_i[best_i] + cost_j[feasible]
-    # On an equal objective, prefer a higher reject threshold.
+    # При точном совпадении стоимости берём правую границу отклонения.
     best_offset = len(losses) - 1 - int(np.argmin(losses[::-1]))
     return float(thresholds[best_i[best_offset]]), float(
         thresholds[feasible_j[best_offset]]
@@ -193,6 +273,17 @@ def _policy_outcomes(
     actions: np.ndarray,
     costs: PolicyCosts,
 ) -> dict[str, float | int | bool | None]:
+    """Считает операционную загрузку и смоделированную экономику политики.
+
+    `actions` выровнен по всему `cohort`, поэтому назначения и доля
+    проверок учитывают все входящие операции. Денежные результаты,
+    включая плату за проверку, считаются на единой выборке `mature`.
+    Остаточный ущерб складывается из потерь на одобренных операциях
+    и доли мошеннических операций, пропущенных ручной проверкой.
+    Стоимость ложных отклонений учитывает все отклонённые легитимные
+    операции и ожидаемую долю ошибок при ручной проверке. Результат
+    содержит количества, доли, затраты и флаги соблюдения лимитов.
+    """
     observed = cohort.loc[mature]
     observed_actions = actions[mature.to_numpy()]
     fraud_amounts, legitimate = _fraud_and_legitimate(observed, costs)
@@ -248,6 +339,7 @@ def _policy_outcomes(
 
 
 def _utc(value: pd.Timestamp) -> pd.Timestamp:
+    """Возвращает временную отметку в UTC для сравнения со срезами витрины."""
     return pd.to_datetime(value, utc=True)
 
 
@@ -267,7 +359,21 @@ def run_risk(
     fraud_lgd: float = 1.0,
     seed: int = 42,
 ) -> dict:
-    """Fit risk models on mature past outcomes and freeze the policy before test."""
+    """Обучает две модели на прошлом и проверяет выбранную политику на тесте.
+
+    Витрина `transactions` содержит `transaction_id`, `event_ts`,
+    `amount`, `is_fraud`, `label_available_at` и признаки `f_*`.
+    `train_end` и `validation_end` задают исключающие правые границы
+    периодов по времени операции. На тесте берутся строки витрины с временем
+    операции до `observation_end`. Метка учитывается, если она известна
+    к этому срезу, даже если сам платёж произошёл гораздо раньше. Параметры сценария
+    описаны в `PolicyCosts`. `seed` фиксирует случайность обучения.
+
+    Сохраняет в `out` обе модели со схемой признаков, таблицы метрик,
+    тестовые значения score и действия, а также JSON со сводкой.
+    Возвращает эту сводку с моделью, порогами, метриками и валидационной
+    долей проверок для прогноза нагрузки.
+    """
     costs = PolicyCosts(
         review_capacity=review_capacity,
         max_fraud_loss_ratio=max_fraud_loss_ratio,
@@ -285,6 +391,8 @@ def run_risk(
     data = transactions.copy()
     data["event_ts"] = pd.to_datetime(data["event_ts"], utc=True)
     data["label_available_at"] = pd.to_datetime(data["label_available_at"], utc=True)
+    # Хронологический порядок нужен CatBoost с has_time и фиксирует
+    # воспроизводимый порядок строк с равными оценками в метриках.
     data.sort_values(["event_ts", "transaction_id"], inplace=True, ignore_index=True)
     amounts = data["amount"].to_numpy(dtype=float)
     if not np.isfinite(amounts).all() or (amounts < 0).any():
@@ -299,6 +407,8 @@ def run_risk(
     test = data.loc[
         data["event_ts"].ge(validation_end) & data["event_ts"].lt(observation_end)
     ]
+    # Проверяем доступность метки на правой границе каждого периода.
+    # Все валидационные и тестовые строки остаются в расчёте загрузки.
     train = train_window.loc[_mature_rows(train_window, train_end)]
     validation_mature = _mature_rows(validation_window, validation_end)
     validation = validation_window.loc[validation_mature]
@@ -308,6 +418,8 @@ def run_risk(
     if test.empty:
         raise ValueError("The test date range contains no transactions")
 
+    # Только входы, размеченные SQL-витриной как признаки. Словари
+    # категорий фиксируются по обучающей выборке.
     features = [column for column in data if column.startswith("f_")]
     if not features:
         raise ValueError("The input mart must provide features prefixed with f_")
@@ -355,6 +467,8 @@ def run_risk(
         )
         fit_options = {"cat_features": list(categories)} if name == "CatBoost" else {}
         model.fit(train_view, target, **fit_options)
+        # Оценка положительного класса задаёт порядок риска. Пороговая
+        # стоимость считается по наблюдаемым исходам валидации.
         val_score = model.predict_proba(validation_view)[:, 1]
         val_metrics = _scores_at_top(
             validation, val_score[validation_mature.to_numpy()], costs.review_capacity
@@ -371,6 +485,8 @@ def run_risk(
             **_policy_outcomes(validation_window, validation_mature, val_actions, costs),
         }
 
+    # Сначала минимизируем стоимость на валидации. При равной стоимости
+    # выбираем более высокую AP. Тестовые оценки считаются после выбора.
     selected = min(
         candidates,
         key=lambda name: (
@@ -400,6 +516,8 @@ def run_risk(
     test_actions = _actions(
         test_score, chosen["review_threshold"], chosen["reject_threshold"]
     )
+    # Сравниваем итоговую политику с одобрением всех операций на тех же
+    # данных. Флаги теста показывают, переносится ли соблюдение лимитов.
     policy_metrics = [
         {
             "split": "validation",
@@ -429,6 +547,8 @@ def run_risk(
         if column in test
     ]
     scored = test[["transaction_id", "event_ts", "amount", "is_fraud", *passthrough]].copy()
+    # Операционное действие требуется каждой строке. Исход скрывается
+    # для меток, которые ещё не были доступны на момент среза.
     scored["is_fraud"] = scored["is_fraud"].where(test_mature).astype("Int8")
     scored["label_mature"] = test_mature
     scored["score"] = test_score
@@ -442,6 +562,8 @@ def run_risk(
         [{"model": name, **outcomes} for name, outcomes in candidates.items()]
     ).to_csv(out / "validation_policy_candidates.csv", index=False)
 
+    # Для CatBoost используем штатную важность признака, для LightGBM —
+    # суммарный выигрыш от разбиений по признаку.
     importance = (
         models[selected].feature_importances_
         if selected == "CatBoost"
