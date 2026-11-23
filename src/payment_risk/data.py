@@ -1,4 +1,9 @@
-"""Generate a reproducible example and validate the shared payment schema."""
+"""Подготовка транзакций для витрин и генерация воспроизводимого демо.
+
+Каждая запись описывает попытку платежа. Для самой попытки, результата
+авторизации и метки мошенничества хранятся отдельные временные поля.
+Это позволяет учитывать момент доступности информации в SQL и при обучении.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +19,7 @@ REQUIRED_COLUMNS = (
 IDENTIFIERS = ("transaction_id", "user_id", "card_id", "merchant_id")
 TIMESTAMPS = ("event_ts", "status_available_at", "label_available_at")
 CATEGORIES = ("merchant_category", "country", "channel")
+# Служебные значения разделяют пропуски и редкие категории.
 MISSING = "__missing__"
 OTHER = "__other__"
 
@@ -36,12 +42,26 @@ NULL_TOKENS = {"", "na", "n/a", "nan", "null", "none", "unknown", "nat"}
 
 
 def _reject_rows(frame: pd.DataFrame, mask: pd.Series | np.ndarray, reason: str) -> None:
+    """Остановить очистку, если маска выделяет некорректные строки.
+
+    `frame` содержит исходные идентификаторы, `mask` отмечает строки
+    с ошибкой, `reason` описывает нарушение. Ошибка ValueError сообщает
+    общее число таких строк и приводит до пяти transaction_id для поиска
+    в источнике. При пустой маске функция завершает проверку.
+    """
     if mask.any():
         examples = frame.loc[mask, "transaction_id"].head(5).fillna("<missing>").tolist()
         raise ValueError(f"{reason}: {int(mask.sum())} rows; transaction_id examples: {examples}")
 
 
 def _parse_boolean(frame: pd.DataFrame, name: str, *, nullable: bool) -> pd.Series:
+    """Прочитать бинарный столбец с числовыми или текстовыми значениями.
+
+    `frame` содержит данные, `name` задаёт имя поля. При `nullable=True`
+    пустое значение сохраняется как pd.NA, например пока метка фрода
+    недоступна. Возвращает Series типа pandas Int8 со значениями 0, 1
+    или pd.NA. Для неизвестного токена поднимает ValueError.
+    """
     tokens = frame[name].astype("string").str.strip().str.casefold()
     missing = tokens.isna() | tokens.isin(NULL_TOKENS)
     parsed = tokens.map(BOOLEAN_VALUES).astype("Int8")
@@ -50,6 +70,12 @@ def _parse_boolean(frame: pd.DataFrame, name: str, *, nullable: bool) -> pd.Seri
 
 
 def _balance(labels: pd.Series) -> dict[str, int | float | None]:
+    """Посчитать баланс классов по Series с метками 0, 1 и pd.NA.
+
+    Возвращает число известных и неизвестных исходов, количества
+    фрода и обычных операций, а также долю фрода среди известных
+    исходов. При отсутствии известных исходов доля равна None.
+    """
     known = int(labels.notna().sum())
     fraud = int(labels.sum())
     return {
@@ -64,7 +90,20 @@ def _balance(labels: pd.Series) -> dict[str, int | float | None]:
 def clean_transactions(
     raw: pd.DataFrame, *, train_end: pd.Timestamp, rare_min_count: int = 25
 ) -> tuple[pd.DataFrame, dict]:
-    """Normalize attempts and learn category vocabulary on pre-cutoff events."""
+    """Проверить входные платежи и подготовить таблицу операций для загрузки в PostgreSQL.
+
+    `raw` содержит столбцы из REQUIRED_COLUMNS. `train_end` задаёт
+    границу обучающего периода в UTC. Словарь категорий использует
+    попытки строго раньше неё. `rare_min_count` задаёт минимальную
+    частоту значения в этих попытках для сохранения в словаре.
+
+    Возвращает таблицу с уникальными transaction_id, полями UTC,
+    нормализованными статусами и категориями, а также словарь аудита.
+    Строки отсортированы по event_ts и transaction_id для воспроизводимости.
+    Аудит содержит счётчики дублей, распределение статусов и категорий,
+    баланс исходных меток и баланс меток, доступных к обучению.
+    Несовместимые поля и конфликтующие записи вызывают ValueError.
+    """
     if not raw.columns.is_unique:
         raise ValueError("Duplicate input column names")
     absent = sorted(set(REQUIRED_COLUMNS) - set(raw.columns))
@@ -76,12 +115,15 @@ def clean_transactions(
     if pd.isna(cutoff):
         raise ValueError("train_end must be a valid timestamp")
 
+    # Сначала оставляем поля контракта и удаляем совпадающие по ним копии.
     frame = raw.loc[:, list(REQUIRED_COLUMNS)].drop_duplicates().reset_index(drop=True)
     exact_duplicates = len(raw) - len(frame)
     for name in IDENTIFIERS:
         frame[name] = frame[name].astype("string").str.strip().replace("", pd.NA)
         _reject_rows(frame, frame[name].isna(), f"Missing {name}")
 
+    # Смешанные смещения переводим в UTC. Метки без смещения читаем как UTC.
+    # Округление вниз до микросекунды согласует точность с типом timestamptz в PostgreSQL.
     rounded_timestamps = 0
     for name in TIMESTAMPS:
         tokens = frame[name].astype("string").str.strip()
@@ -92,18 +134,23 @@ def clean_transactions(
         rounded_timestamps += int((parsed.notna() & (parsed != rounded)).sum())
         frame[name] = rounded
 
+    # Модель затрат использует положительные конечные суммы попыток.
+    # Метка фрода может ожидать подтверждения. Сигнал мониторинга обязателен.
     amounts = pd.to_numeric(frame["amount"], errors="coerce").astype("float64")
     _reject_rows(frame, ~np.isfinite(amounts) | (amounts <= 0), "Invalid amount (expected finite positive value)")
     frame["amount"] = amounts
     frame["is_fraud"] = _parse_boolean(frame, "is_fraud", nullable=True)
     frame["operational_risk_flag"] = _parse_boolean(frame, "operational_risk_flag", nullable=False).astype("int8")
 
+    # Единый словарь статусов делает долю отказов сопоставимой по источникам.
+    # Неизвестные исходы авторизации храним под статусом unknown.
     status_tokens = (
         frame["status"].astype("string").str.strip().str.casefold().str.replace(r"[\s-]+", "_", regex=True)
     )
     status_unrecognized = status_tokens.notna() & ~status_tokens.isin(set(STATUS_ALIASES) | NULL_TOKENS)
     unrecognized_status_rows = int(status_unrecognized.sum())
     frame["status"] = status_tokens.map(STATUS_ALIASES).fillna("unknown").astype("string")
+    # Для известного статуса и метки сохраняем момент их наблюдения.
     _reject_rows(
         frame, (frame["status"] != "unknown") & frame["status_available_at"].isna(),
         "A known status requires status_available_at",
@@ -118,13 +165,15 @@ def clean_transactions(
     for name in CATEGORIES:
         value = frame[name].astype("string").str.strip()
         if name == "country":
-            # NA is ISO 3166-1 for Namibia, so preserve it as a valid country.
+            # NA сохраняем как код Намибии по ISO 3166-1.
             value = value.mask(value.str.casefold().isin(NULL_TOKENS - {"na"})).str.upper()
         else:
             value = value.mask(value.str.casefold().isin(NULL_TOKENS)).str.casefold()
             value = value.str.replace(r"\s+", "_", regex=True)
         frame[name] = value
 
+    # Повторяем дедупликацию после нормализации. Разные записи под одним
+    # ID считаем конфликтом и передаём на разбор в источнике.
     before_canonical_dedup = len(frame)
     frame = frame.drop_duplicates().copy()
     canonical_duplicates = before_canonical_dedup - len(frame)
@@ -136,6 +185,8 @@ def clean_transactions(
     if not pretrain.any():
         raise ValueError("No transactions before train_end (required to fit category vocabulary)")
 
+    # Для числа стран по карте сохраняем нормализованный код страны.
+    # Словарь категорий строим по обучающему периоду и применяем ко всем строкам.
     frame["country_raw"] = frame["country"]
     rare_categories = {}
     for name in CATEGORIES:
@@ -153,6 +204,7 @@ def clean_transactions(
         }
 
     frame = frame.sort_values(["event_ts", "transaction_id"], ignore_index=True)
+    # Баланс обучения учитывает только исходы, известные на дату train_end.
     train_rows = frame["event_ts"] < cutoff
     training_labels = frame.loc[train_rows, "is_fraud"].where(frame.loc[train_rows, "label_available_at"] <= cutoff)
     audit = {
@@ -178,24 +230,46 @@ def clean_transactions(
 
 
 def _sigmoid(log_odds: np.ndarray) -> np.ndarray:
+    """Преобразовать массив логарифмов шансов в вероятности той же формы.
+
+    `log_odds` складывает вклады отдельных факторов. Сигмоида переводит
+    результат в диапазон от 0 до 1 для розыгрыша бинарного исхода.
+    """
     return 1.0 / (1.0 + np.exp(-log_odds))
 
 
 def generate_demo(*, days: int = 98, seed: int = 42) -> tuple[pd.DataFrame, dict]:
-    """Simulate recurring users, seasonal payment volume, and delayed fraud labels."""
+    """Сгенерировать последовательность попыток оплаты с 6 января 2025 года.
+
+    `days` задаёт длину календарного горизонта в UTC, `seed` фиксирует
+    случайные выборки. Генератор моделирует повторяющееся поведение клиентов,
+    суточный и недельный профиль нагрузки, редкие риск-события и всплески.
+    Исход фрода доступен через 48–72 часа для обоих классов.
+
+    Возвращает сырую таблицу по REQUIRED_COLUMNS и метаданные с границами,
+    временем и типом заданных аномалий и параметрами генерации. Представления
+    времени, синонимы статусов и дубликаты в таблице демонстрируют очистку.
+    Сценарии аномалий и внутренние профили клиентов служат эталоном
+    симуляции за пределами входных полей моделей.
+    """
     if days < 1:
         raise ValueError("days must be positive")
     rng = np.random.default_rng(seed)
     hours = pd.date_range("2025-01-06", periods=24 * days, freq="h", tz="UTC")
     hour_of_day = hours.hour.to_numpy()
+    # Базовый поток складывается из фоновой нагрузки и дневного
+    # и вечернего пиков. Число попыток в каждом часу случайно по Пуассону.
     service_rate = (
         10.0
         + 19.0 * np.exp(-0.5 * ((hour_of_day - 13) / 4.7) ** 2)
         + 33.0 * np.exp(-0.5 * ((hour_of_day - 20) / 3.1) ** 2)
     )
+    # Недельный множитель меняет профиль по дням, линейный тренд даёт рост.
     weekday_factor = np.array([0.94, 0.99, 1.02, 1.04, 1.12, 1.04, 0.86])[hours.dayofweek]
     counts = rng.poisson(service_rate * weekday_factor * (1 + 0.0015 * np.arange(len(hours)) / 24))
 
+    # Параметры в массивах идут в порядке категорий. Для каждой категории
+    # задаём типичную сумму, долю онлайн-платежей и пул мерчантов.
     category_names = np.array([
         "groceries", "restaurants", "transport", "subscriptions", "gaming",
         "digital_goods", "travel", "electronics", "specialty",
@@ -204,6 +278,8 @@ def generate_demo(*, days: int = 98, seed: int = 42) -> tuple[pd.DataFrame, dict
     amount_center = np.array([41.0, 30.0, 17.0, 14.0, 41.0, 43.0, 123.0, 81.0, 29.0])
     online_prob = np.array([0.10, 0.19, 0.23, 0.96, 0.90, 0.97, 0.89, 0.60, 0.33])
     merchant_counts = np.array([33, 38, 21, 18, 23, 26, 18, 29, 5])
+    # Позиция аномалии задаётся долей горизонта и конкретным часом суток.
+    # Акции и риск-волны добавляют попытки. Сбой обнуляет обычный поток часа.
     injections = (
         (0.43, 17, "promotion", 7, 76),
         (0.73, 2, "card_testing", 4, 88),
@@ -228,11 +304,15 @@ def generate_demo(*, days: int = 98, seed: int = 42) -> tuple[pd.DataFrame, dict
             "extra_transactions": change,
         })
 
+    # Повторяем индекс часа по числу попыток и добавляем ряды сценариев,
+    # чтобы дальше настраивать их категории и поведение отдельно.
     regular_hours = np.repeat(np.arange(len(hours)), counts)
     injected_hours = [np.full(extra, index) for index, _, _, extra in indexed_injections if extra]
     hour_index = np.concatenate([regular_hours, *injected_hours])
     size = len(hour_index)
 
+    # Постоянный профиль создаёт историю клиента, карты и мерчанта.
+    # Логнормальные веса дают разные частоты покупок у разных клиентов.
     user_count = 2900
     countries = np.array(["US", "GB", "DE", "FR", "CA", "NL", "BR", "JP", "AE", "MX", "NZ", "SG"])
     country_prob = np.array([0.39, 0.15, 0.12, 0.10, 0.07, 0.05, 0.044, 0.032, 0.016, 0.020, 0.006, 0.002])
@@ -244,6 +324,8 @@ def generate_demo(*, days: int = 98, seed: int = 42) -> tuple[pd.DataFrame, dict
     user_preferred_merchant = rng.integers(merchant_counts[user_preferred_category])
     has_second_card = rng.random(user_count) < 0.22
 
+    # Обычные покупки могут следовать предпочтениям клиента. У части
+    # попыток создаём рискованный паттерн, который влияет на выбор категории.
     user = rng.choice(user_count, size, p=user_weight)
     category = rng.choice(len(category_names), size, p=category_prob)
     choose_favorite = rng.random(size) < 0.27
@@ -252,6 +334,8 @@ def generate_demo(*, days: int = 98, seed: int = 42) -> tuple[pd.DataFrame, dict
     abusive_category = abusive_pattern & (rng.random(size) < 0.58)
     category[abusive_category] = rng.choice([4, 5, 6, 7], abusive_category.sum(), p=[0.29, 0.31, 0.10, 0.30])
 
+    # Сценарии задают категорию своим попыткам. В проверке карт сужаем
+    # набор клиентов, чтобы в течение часа появлялись повторные операции.
     promotion = np.zeros(size, dtype=bool)
     high_ticket = np.zeros(size, dtype=bool)
     card_testing = np.zeros(size, dtype=bool)
@@ -277,12 +361,14 @@ def generate_demo(*, days: int = 98, seed: int = 42) -> tuple[pd.DataFrame, dict
         (category == user_preferred_category[user]) & (rng.random(size) < 0.39)
     )
     merchant[repeat_merchant] = user_preferred_merchant[user[repeat_merchant]]
-    # Injected events are concentrated at a few vendors within a category.
+    # Эффект сценария сосредоточен у нескольких мерчантов выбранной категории.
     merchant[promotion] = rng.choice([1, 2], promotion.sum(), p=[0.75, 0.25])
     merchant[high_ticket] = 3
     merchant[card_testing] = 0
     elevated_merchant = (merchant <= 1) & np.isin(category, [4, 5, 7])
 
+    # У клиента есть постоянная основная карта и иногда дополнительная.
+    # Для подозрительного поведения чаще выбираем онлайн и другую страну.
     second_card = has_second_card[user] & (rng.random(size) < 0.23) & ~card_testing
     card = 2 * user + second_card
     country = user_home[user].copy()
@@ -295,6 +381,9 @@ def generate_demo(*, days: int = 98, seed: int = 42) -> tuple[pd.DataFrame, dict
     channel = np.where(online, np.where(rng.random(size) < 0.63, "web", "app"), "pos").astype("U8")
     channel[(rng.random(size) < 0.00020) & ~abusive_pattern] = "partner"
 
+    # Сумма зависит от категории, привычного уровня трат и случайного
+    # отклонения. В крупных покупках отклонение увеличено, в проверке
+    # карт суммы уменьшены. Итог округляем до двух знаков.
     ratio_to_expected = rng.lognormal(0.0, 0.60, size)
     ratio_to_expected[abusive_pattern] *= rng.lognormal(1.33, 0.39, abusive_pattern.sum())
     ratio_to_expected[high_ticket] *= 4.3
@@ -303,7 +392,9 @@ def generate_demo(*, days: int = 98, seed: int = 42) -> tuple[pd.DataFrame, dict
     unusually_large = ratio_to_expected >= 2.5
     local_hour = hour_of_day[hour_index]
     night = (local_hour < 6) | (local_hour == 23)
-    # Distinct random draws for the observed risk alert and the latent outcome.
+    # Веса повышают шансы фрода, например при необычно крупной или ночной
+    # операции. Контекст также задаёт вероятность сигнала мониторинга.
+    # Сам исход и сигнал разыгрываем отдельными случайными выборками.
     fraud_rate = _sigmoid(
         -6.37 + 1.39 * online + 1.72 * foreign + 1.35 * unusually_large
         + 0.85 * night + 0.48 * np.isin(category, [4, 5, 7])
@@ -315,6 +406,8 @@ def generate_demo(*, days: int = 98, seed: int = 42) -> tuple[pd.DataFrame, dict
         + 0.66 * elevated_merchant + 1.28 * abusive_pattern + 2.35 * card_testing
     )
     operational_flag = rng.random(size) < alert_rate
+    # Исторический результат авторизации моделируем по контексту и сигналу.
+    # Для очистки добавляем варианты написания и отдельные технические статусы.
     decline_rate = _sigmoid(
         -3.66 + 0.60 * online + 0.58 * foreign + 0.35 * unusually_large
         + 0.70 * abusive_pattern + 1.20 * operational_flag + 1.37 * card_testing
@@ -327,6 +420,8 @@ def generate_demo(*, days: int = 98, seed: int = 42) -> tuple[pd.DataFrame, dict
     status[technical_error] = "failed"
     status[still_pending] = "pending"
 
+    # Внутри часа время попытки распределено случайно. Статусы появляются
+    # с задержкой в секундах, а метки фрода дозревают через 48–72 часа.
     offsets_us = rng.integers(0, 3_600_000_000, size=size)
     event_ts = hours.take(hour_index) + pd.to_timedelta(offsets_us, unit="us")
     status_lag_seconds = rng.integers(1, 240, size=size)
@@ -353,6 +448,8 @@ def generate_demo(*, days: int = 98, seed: int = 42) -> tuple[pd.DataFrame, dict
         "label_available_at": labels_at,
         "operational_risk_flag": operational_flag.astype("int8"),
     })
+    # Представляем часть исходных времён со смещением Нью-Йорка, часть
+    # без явного UTC-смещения. После очистки они описывают те же моменты.
     alternate_timestamps = rng.choice(size, 2 * (size // 20), replace=False)
     non_utc, naive_utc = np.split(alternate_timestamps, 2)
     for name in TIMESTAMPS:
@@ -362,6 +459,7 @@ def generate_demo(*, days: int = 98, seed: int = 42) -> tuple[pd.DataFrame, dict
         mixed.iloc[naive_utc] = original.iloc[naive_utc].dt.tz_localize(None).astype("string")
         raw[name] = mixed
 
+    # Добавляем точные копии и перемешиваем выгрузку для проверки очистки.
     duplicate_count = max(1, size // 1000)
     duplicates = raw.iloc[rng.choice(size, duplicate_count, replace=False)]
     raw = pd.concat([raw, duplicates], ignore_index=True)

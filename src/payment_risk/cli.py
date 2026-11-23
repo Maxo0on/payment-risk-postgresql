@@ -1,4 +1,4 @@
-"""Run the same chronological pipeline on the demo or a transaction file."""
+"""Запуск эксперимента на синтетических данных или на файле транзакций."""
 
 import argparse
 import json
@@ -21,6 +21,12 @@ DAY = pd.Timedelta(days=1)
 
 
 def parse_instant(value: str) -> pd.Timestamp:
+    """Преобразовать дату из аргумента командной строки в момент времени UTC.
+
+    pandas учитывает смещение в строке, а дату без часового пояса трактует как UTC.
+    Для пустой или некорректной даты возвращаем ошибку формата argparse, чтобы при
+    запуске пользователь увидел имя параметра, значение которого нужно исправить.
+    """
     try:
         stamp = pd.to_datetime(value, utc=True)
         if pd.isna(stamp):
@@ -31,6 +37,12 @@ def parse_instant(value: str) -> pd.Timestamp:
 
 
 def make_parser() -> argparse.ArgumentParser:
+    """Описать параметры ввода, временных срезов и экономики решений.
+
+    Возвращает настроенный парсер. Проверку длительности периодов выполняет
+    timeline после чтения данных. Денежные параметры передаются в run_risk
+    в той же единице измерения, в которой пользователь указал сумму платежа.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, help="CSV, CSV.GZ or Parquet transactions. Omit for the demo.")
     parser.add_argument("--out", type=Path, default=Path("results"))
@@ -52,6 +64,12 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def read_transactions(path: Path) -> pd.DataFrame:
+    """Прочитать файл в таблицу для последующей проверки в clean_transactions.
+
+    Для Parquet сохраняются типы столбцов. В CSV и CSV.GZ значения читаются
+    как строки, чтобы сохранить ведущие нули в идентификаторах и буквенные
+    коды вроде NA. Распознавание пропусков и преобразование типов делает очистка.
+    """
     if path.suffix.lower() == ".parquet":
         return pd.read_parquet(path)
     if path.name.lower().endswith((".csv", ".csv.gz")):
@@ -60,6 +78,13 @@ def read_transactions(path: Path) -> pd.DataFrame:
 
 
 def timeline(args: argparse.Namespace, raw: pd.DataFrame) -> tuple[pd.Timestamp, ...]:
+    """Вычислить пять UTC-границ эксперимента по аргументам и времени операций.
+
+    Возвращает начало наблюдаемого ряда, конец обучения, конец валидации,
+    конец ряда и момент доступности исходов. Последние две даты могут различаться:
+    платёж уже входит в завершённый час, а его исход может стать известен позже.
+    Некорректный порядок границ или слишком короткий период вызывают ValueError.
+    """
     if args.input is None:
         start = DEMO_START
         end = start + args.days * DAY
@@ -72,6 +97,8 @@ def timeline(args: argparse.Namespace, raw: pd.DataFrame) -> tuple[pd.Timestamp,
         if "event_ts" not in raw:
             raise ValueError("Input has no event_ts column.")
         event = pd.to_datetime(raw["event_ts"], utc=True, format="mixed", errors="coerce")
+        # В выгрузке на 15:37 час с 15:00 ещё неполный. Последний час ряда
+        # определяется по операциям, произошедшим строго до 15:00.
         closed_hours = event[event < observation_end.floor("h")]
         if closed_hours.empty:
             raise ValueError("No transactions in complete UTC hours before --observation-end.")
@@ -80,6 +107,8 @@ def timeline(args: argparse.Namespace, raw: pd.DataFrame) -> tuple[pd.Timestamp,
 
     calendar_start = start.ceil("D")
     calendar_days = (end.floor("D") - calendar_start).days
+    # По умолчанию под обучение отводится 64% полных суток с округлением вверх.
+    # Окончание валидации — примерно 79% всего периода, минимум через 6 суток после обучения.
     default_train_days = max(21, (calendar_days * 64 + 99) // 100)
     train_end = args.train_end or calendar_start + default_train_days * DAY
     default_validation = calendar_start + (calendar_days * 79 // 100) * DAY
@@ -94,6 +123,13 @@ def timeline(args: argparse.Namespace, raw: pd.DataFrame) -> tuple[pd.Timestamp,
 
 
 def run(args: argparse.Namespace) -> Path:
+    """Выполнить эксперимент с настройками CLI и вернуть путь к HTML-отчёту.
+
+    Операции из файла или генератора проходят одну очистку. PostgreSQL строит
+    часовую и транзакционную витрины. Скоринг формирует решения на тесте,
+    а прогноз использует их для оценки почасовой нагрузки проверок. Промежуточные
+    таблицы, параметры срезов и итоговые метрики сохраняются в каталоге --out.
+    """
     if args.input is None and args.days < 34:
         raise ValueError("The demo requires at least 34 days. The default is 98.")
     if args.input is None:
@@ -108,10 +144,14 @@ def run(args: argparse.Namespace) -> Path:
     source_events = pd.to_datetime(raw["event_ts"], utc=True, format="mixed", errors="coerce")
     in_window = source_events.ge(start) & source_events.lt(end)
     excluded_events = int((source_events.notna() & ~in_window).sum())
+    # Строки с некорректным временем передаём в проверку исходных данных:
+    # простая фильтрация по датам молча исключила бы их из эксперимента.
     raw = raw.loc[in_window | source_events.isna()]
     clean, audit = clean_transactions(raw, train_end=train_end, rare_min_count=args.rare_min_count)
     audit["rows_outside_complete_hours"] = excluded_events
 
+    # В файле могут быть исходы, подтвердившиеся уже после выбранной даты среза.
+    # Убираем и метку, и дату подтверждения, прежде чем сохранять данные для моделирования.
     labels_unavailable = clean["label_available_at"].gt(observation_end)
     audit["labels_hidden_at_observation_cutoff"] = int(labels_unavailable.sum())
     clean = clean.copy()
@@ -131,6 +171,8 @@ def run(args: argparse.Namespace) -> Path:
         review_false_decline_rate=args.review_false_decline_rate, fraud_lgd=args.fraud_lgd, seed=args.seed,
     )
     LOG.info("Backtesting hourly forecasts and looking for anomalous peaks")
+    # Доля review на валидации нужна для прогноза. Решения на тесте нужны для
+    # сравнения этого прогноза с фактическим числом направлений на проверку.
     scored = pd.read_csv(out / "test_scored.csv")
     forecast = run_forecast(
         hourly, scored, out, train_end=train_end, validation_end=validation_end,
@@ -161,6 +203,11 @@ def run(args: argparse.Namespace) -> Path:
 
 
 def main() -> int:
+    """Прочитать аргументы, запустить эксперимент и вывести путь к отчёту.
+
+    При успехе возвращает код 0. Для отсутствующего файла, ошибки в данных
+    или ошибки подключения к PostgreSQL завершает процесс с кодом 2 и сообщением.
+    """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
     parser = make_parser()
     args = parser.parse_args()
