@@ -47,22 +47,23 @@ jobs:
       - name: Run demo
         # 42 дня достаточно для короткой проверки всех стадий проекта.
         run: python -m payment_risk --days 42 --out results_ci
+      - name: Record Python environment
+        run: |
+          python -VV > results_ci/environment.txt
+          python -m pip list --format=freeze >> results_ci/environment.txt
       - name: Check demo outputs
         # test -s проверяет, что каждый ожидаемый файл существует и заполнен.
         run: |
           for artifact in report.html hourly_mart.parquet transaction_mart.parquet \
                           risk_metrics.csv policy_metrics.csv forecast_next_24h.csv \
-                          anomaly_hours.csv test_scored.csv; do
+                          anomaly_hours.csv test_scored.csv risk_summary.json forecast_summary.json \
+                          models/catboost.cbm models/lightgbm.txt models/feature_schema.json; do
             test -s "results_ci/$artifact"
           done
-      - name: Upload demo report
+      - name: Upload complete demo results
         uses: actions/upload-artifact@v4
         with:
-          # Отчёт и сводные метрики доступны для скачивания из вкладки Actions.
+          # Сохраняем результаты этого синтетического прогона вместе с его моделями.
           name: payment-risk-demo
-          path: |
-            results_ci/report.html
-            results_ci/risk_metrics.csv
-            results_ci/policy_metrics.csv
-            results_ci/forecast_metrics.csv
+          path: results_ci/
           if-no-files-found: error
