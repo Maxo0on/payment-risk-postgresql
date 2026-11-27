@@ -1,0 +1,49 @@
+{
+  "selected_models": {
+    "n_transactions": "sarimax",
+    "total_amount": "sarimax",
+    "risk_events": "sarimax"
+  },
+  "classic_fit_status": {
+    "n_transactions": "converged",
+    "total_amount": "converged",
+    "risk_events": "converged"
+  },
+  "selection_hours": 72,
+  "alert_calibration_hours": 72,
+  "test_hours": 216,
+  "anomaly_hours": 8,
+  "anomaly_thresholds": {
+    "n_transactions": {
+      "residual_median": 0.8922516944105059,
+      "residual_scale": 5.865678177823941,
+      "robust_z_threshold": 3.5,
+      "residual_threshold": 21.4221253167943
+    },
+    "total_amount": {
+      "residual_median": -74.34489471359592,
+      "residual_scale": 514.0397636357941,
+      "robust_z_threshold": 3.6482817185860927,
+      "residual_threshold": 1801.0169775851878
+    },
+    "risk_events": {
+      "residual_median": 0.08179484360991335,
+      "residual_scale": 0.7661047830035548,
+      "robust_z_threshold": 4.871573304761105,
+      "residual_threshold": 3.81393045313983
+    }
+  },
+  "reference_review_rate": 0.05501027162748231,
+  "review_count_mae": 1.4606359880393327,
+  "peak_test_expected_review_hour": "2025-02-14T20:00:00+00:00",
+  "peak_test_expected_reviews": 3.1750323884383715,
+  "peak_test_actual_review_hour": "2025-02-14T03:00:00+00:00",
+  "peak_test_actual_reviews": 38,
+  "peak_next_expected_review_hour": "2025-02-17T20:00:00+00:00",
+  "peak_next_expected_reviews": 2.7526534726363487,
+  "peak_next_expected_risk_hour": "2025-02-17T20:00:00+00:00",
+  "peak_next_expected_risk_events": 1.4513192917712667,
+  "risk_events_definition": "Count of contemporaneous operational risk flags, available by hour close",
+  "origin_convention": "The UTC timestamp is the first forecasted hour. The last observation available precedes that hour.",
+  "review_formula": "expected_review_count = pred_n_transactions * reference_review_rate"
+}

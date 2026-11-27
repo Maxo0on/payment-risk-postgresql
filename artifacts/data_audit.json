@@ -1,0 +1,87 @@
+{
+  "raw_rows": 30325,
+  "clean_rows": 30295,
+  "exact_duplicate_rows": 30,
+  "canonical_duplicate_rows": 0,
+  "transaction_id_unique": true,
+  "start_utc": "2025-01-06T00:05:45.728416+00:00",
+  "latest_event_utc": "2025-02-16T23:57:59.553442+00:00",
+  "timezone": "UTC",
+  "submicrosecond_timestamp_values_rounded_down": 0,
+  "normalized_status_counts": {
+    "approved": 28697,
+    "declined": 1453,
+    "error": 78,
+    "pending": 67
+  },
+  "unrecognized_status_rows_before_canonical_dedup": 0,
+  "rare_min_count": 25,
+  "rare_categories": {
+    "merchant_category": {
+      "kept": [
+        "digital_goods",
+        "electronics",
+        "gaming",
+        "groceries",
+        "restaurants",
+        "specialty",
+        "subscriptions",
+        "transport",
+        "travel"
+      ],
+      "rare_training_categories": 0,
+      "unseen_later_categories": 0,
+      "rows_mapped_to_other": 0,
+      "missing_rows": 0
+    },
+    "country": {
+      "kept": [
+        "AE",
+        "BR",
+        "CA",
+        "DE",
+        "FR",
+        "GB",
+        "JP",
+        "MX",
+        "NL",
+        "NZ",
+        "SG",
+        "US"
+      ],
+      "rare_training_categories": 0,
+      "unseen_later_categories": 0,
+      "rows_mapped_to_other": 0,
+      "missing_rows": 0
+    },
+    "channel": {
+      "kept": [
+        "app",
+        "pos",
+        "web"
+      ],
+      "rare_training_categories": 1,
+      "unseen_later_categories": 0,
+      "rows_mapped_to_other": 2,
+      "missing_rows": 0
+    }
+  },
+  "fraud_class_balance": {
+    "all_supplied_labels": {
+      "known": 30295,
+      "fraud": 682,
+      "non_fraud": 29613,
+      "unknown": 0,
+      "fraud_rate": 0.02251196567090279
+    },
+    "mature_at_train_end": {
+      "known": 17110,
+      "fraud": 304,
+      "non_fraud": 16806,
+      "unknown": 2032,
+      "fraud_rate": 0.017767387492694332
+    }
+  },
+  "rows_outside_complete_hours": 0,
+  "labels_hidden_at_observation_cutoff": 1889
+}

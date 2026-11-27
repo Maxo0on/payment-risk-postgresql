@@ -1,0 +1,75 @@
+{
+  "features": [
+    "f_amount",
+    "f_merchant_category",
+    "f_country",
+    "f_channel",
+    "f_hour_utc",
+    "f_day_of_week",
+    "f_is_weekend",
+    "f_user_count_1h",
+    "f_user_count_24h",
+    "f_user_count_7d",
+    "f_user_sum_1h",
+    "f_user_sum_24h",
+    "f_user_sum_7d",
+    "f_user_avg_amount_1h",
+    "f_user_avg_amount_24h",
+    "f_user_avg_amount_7d",
+    "f_user_seconds_since_previous",
+    "f_card_count_7d",
+    "f_card_distinct_countries_7d",
+    "f_card_distinct_merchants_7d",
+    "f_card_avg_amount_7d",
+    "f_card_amount_difference_7d",
+    "f_card_amount_zscore_7d",
+    "f_merchant_count_1h",
+    "f_merchant_sum_1h",
+    "f_merchant_avg_amount_1h",
+    "f_merchant_count_7d",
+    "f_merchant_known_status_count_1h",
+    "f_merchant_decline_rate_1h",
+    "f_merchant_known_status_count_7d",
+    "f_merchant_decline_rate_7d",
+    "f_merchant_risk_segment"
+  ],
+  "categories": {
+    "f_merchant_category": [
+      "digital_goods",
+      "electronics",
+      "gaming",
+      "groceries",
+      "restaurants",
+      "specialty",
+      "subscriptions",
+      "transport",
+      "travel"
+    ],
+    "f_country": [
+      "AE",
+      "BR",
+      "CA",
+      "DE",
+      "FR",
+      "GB",
+      "JP",
+      "MX",
+      "NL",
+      "NZ",
+      "SG",
+      "US"
+    ],
+    "f_channel": [
+      "__other__",
+      "app",
+      "pos",
+      "web"
+    ],
+    "f_merchant_risk_segment": [
+      "high",
+      "insufficient_history",
+      "low",
+      "medium"
+    ]
+  }
+}

@@ -60,6 +60,8 @@ jobs:
                           models/catboost.cbm models/lightgbm.txt models/feature_schema.json; do
             test -s "results_ci/$artifact"
           done
+      - name: Verify saved models, decisions and forecasts
+        run: python scripts/verify_artifacts.py results_ci
       - name: Upload complete demo results
         uses: actions/upload-artifact@v4
         with:
